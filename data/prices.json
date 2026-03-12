@@ -10,6 +10,8 @@
   "gold_egp_gram_14k": 5102,
   "gold_egp_pound": 61227,
   "gold_egp_oz": 272062,
-  "source": "dahabmasr.com + Yahoo Finance",
-  "timestamp": "2026-03-12T12:26:14.598493+00:00"
+  "status": "fallback",
+  "fallback_used": true,
+  "source": "Fallback Calculation",
+  "timestamp": "2026-03-12T13:43:26.476909+00:00"
 }
