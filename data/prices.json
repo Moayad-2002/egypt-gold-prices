@@ -1,1 +1,15 @@
-{}
+{
+  "gold_usd_oz": 5182,
+  "usd_egp": 52.5,
+  "gold_egp_gram_24k": 8747,
+  "gold_egp_gram_24k_sell": 8659,
+  "gold_egp_gram_21k": 7653,
+  "gold_egp_gram_21k_sell": 7577,
+  "gold_egp_gram_18k": 6560,
+  "gold_egp_gram_18k_sell": 6494,
+  "gold_egp_gram_14k": 5102,
+  "gold_egp_pound": 61227,
+  "gold_egp_oz": 272062,
+  "source": "dahabmasr.com + Yahoo Finance",
+  "timestamp": "2026-03-12T11:19:13.203116+00:00"
+}
