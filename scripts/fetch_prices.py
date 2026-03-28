@@ -2,9 +2,11 @@
 """
 scripts/fetch_prices.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Gold:    edahabapp.com → dahabmasr.com → math fallback
-USD/EGP: edahabapp.com → open.er-api.com → hardcoded
-Gold/oz: edahabapp.com → yf.download    → hardcoded
+Tier 1  — edahabapp.com   (local EGP prices, USD/EGP, oz price)
+Tier 2  — dahabmasr.com   (local EGP prices fallback)
+Tier 3  — open.er-api.com (USD/EGP fallback — free, no key, supports EGP)
+Tier 4  — Yahoo Finance   (gold USD/oz fallback)
+Tier 5  — math calculation (last resort)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -28,190 +30,208 @@ HEADERS = {
     ),
     "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
+KARAT_MAP = {"24": "g24k", "21": "g21k", "18": "g18k", "14": "g14k"}
 
-# ──────────────────────────────────────────
-# Retry wrapper
-# ──────────────────────────────────────────
-def with_retry(fn, attempts=3, delay=3):
+
+# ──────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────
+
+def with_retry(fn, attempts: int = 3, delay: int = 4):
+    """Run fn up to `attempts` times, sleeping `delay` seconds between tries."""
     last_err = None
     for i in range(attempts):
         try:
             return fn()
         except Exception as e:
             last_err = e
-            print(f"  ↳ Attempt {i+1}/{attempts} failed: {e}")
+            print(f"    ↳ attempt {i+1}/{attempts} failed: {e}")
             if i < attempts - 1:
                 time.sleep(delay)
     raise last_err
 
 
-# ──────────────────────────────────────────
-# USD/EGP — open.er-api.com (free, no key, supports EGP)
-# ──────────────────────────────────────────
-def get_usd_egp_openapi() -> float:
-    url = "https://open.er-api.com/v6/latest/USD"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("result") != "success":
-        raise ValueError(f"open.er-api error: {data}")
-    rate = data["rates"].get("EGP")
-    if not rate:
-        raise ValueError("EGP not found in open.er-api response")
-    return float(rate)
+def safe_int(s: str) -> int:
+    return int(s.replace(",", "").strip())
 
 
-# ──────────────────────────────────────────
-# Gold USD/oz — Yahoo Finance
-# ──────────────────────────────────────────
-def get_gold_usd_yahoo() -> float:
-    df = yf.download("XAUUSD=X", period="1d", interval="5m",
-                     progress=False, auto_adjust=True)
-    if df is None or df.empty:
-        raise ValueError("Empty dataframe from Yahoo for XAUUSD=X")
-    return float(df["Close"].iloc[-1])
+def safe_float(s: str) -> float:
+    return float(s.replace(",", "").strip())
 
 
-# ──────────────────────────────────────────
-# ① edahabapp.com — Primary scraper
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# Tier 1 — edahabapp.com
+#
+# Verified HTML structure (static, no JS rendering):
+#
+#   الذهب عيار 24:
+#   [blank line]
+#   بيع: 7840 جنيه
+#   شراء: 7784 جنيه
+#   ...
+#   سعر الجنيه الذهب:
+#   54880 جنيه
+#   سعر الأوقية عالمياً:
+#   4493 دولار
+#   الدولار الأمريكي:
+#   52.75 جنيه
+# ──────────────────────────────────────────────────────────────
+
+# Flexible regex — handles blank lines between karat header and prices
+_KARAT_RE = re.compile(
+    r"عيار\s*(\d+)[^\n]*\n"      # عيار 24:
+    r"[\s\S]{0,30}?"              # skip optional blank lines (max 30 chars)
+    r"بيع:\s*([\d,]+)[^\n]*\n"   # بيع: 7840 جنيه
+    r"[\s\S]{0,30}?"
+    r"شراء:\s*([\d,]+)",          # شراء: 7784 جنيه
+)
+
+
 def scrape_edahab() -> dict:
     url = "https://edahabapp.com/"
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    print(f"  ↳ HTTP {response.status_code} from {url}")
-    if response.status_code in (403, 429, 503):
-        raise ValueError(f"Blocked: HTTP {response.status_code}")
-    response.raise_for_status()
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    print(f"  ↳ HTTP {resp.status_code} — edahabapp.com ({len(resp.text):,} bytes)")
 
-    soup = BeautifulSoup(response.text, "lxml")
-    full_text = soup.get_text(separator="\n", strip=True)
-    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    if resp.status_code in (403, 429, 503):
+        raise ValueError(f"Blocked by server: HTTP {resp.status_code}")
+    resp.raise_for_status()
 
-    # Debug: print relevant lines so we can see what the scraper sees
-    relevant = [l for l in lines if any(
-        k in l for k in ["عيار", "بيع", "شراء", "جنيه", "دولار", "أوقية", "الذهب"]
-    )]
-    print(f"  ↳ Found {len(relevant)} relevant lines on edahabapp:")
-    for l in relevant[:30]:
-        print(f"     | {repr(l)}")
+    html = resp.text
+
+    if "عيار" not in html:
+        raise ValueError(
+            f"Unexpected page content — 'عيار' not found. "
+            f"First 300 chars: {html[:300]}"
+        )
 
     prices = {}
 
-    def extract_number(text: str):
-        nums = re.findall(r"[\d,]+", text)
-        for n in nums:
-            val = float(n.replace(",", ""))
-            if val > 100:
-                return val
-        return None
+    # ── عيار prices ──
+    for m in _KARAT_RE.finditer(html):
+        karat, sell_s, buy_s = m.group(1), m.group(2), m.group(3)
+        key = KARAT_MAP.get(karat)
+        if key:
+            prices[key] = {"sell": safe_int(sell_s), "buy": safe_int(buy_s)}
+            print(f"  ↳ {key}: buy={prices[key]['buy']:,}  sell={prices[key]['sell']:,}")
 
-    karat_map = {"24": "g24k", "21": "g21k", "18": "g18k", "14": "g14k"}
+    # ── جنيه الذهب ──
+    m = re.search(r"الجنيه الذهب[^\n]*\n\s*([\d,]+)", html)
+    if m:
+        prices["pound"] = safe_int(m.group(1))
+        print(f"  ↳ pound = {prices['pound']:,}")
 
-    i = 0
-    current_karat = None
+    # ── أوقية عالمياً ──
+    m = re.search(r"الأوقية عالمياً[^\n]*\n\s*([\d,]+)", html)
+    if m:
+        prices["oz_usd"] = safe_int(m.group(1))
+        print(f"  ↳ oz_usd = {prices['oz_usd']:,}")
 
-    while i < len(lines):
-        line = lines[i]
-
-        # Detect karat — handles "عيار 24:" and "الذهب عيار 24:"
-        for karat, key in karat_map.items():
-            if f"عيار {karat}" in line:
-                current_karat = key
-                break
-
-        # بيع line → sell price
-        if current_karat and "بيع" in line and "شراء" not in line:
-            val = extract_number(line)
-            if val:
-                prices.setdefault(current_karat, {})["sell"] = val
-                print(f"  ↳ Parsed {current_karat} sell = {val}")
-
-        # شراء line → buy price
-        if current_karat and "شراء" in line:
-            val = extract_number(line)
-            if val:
-                prices.setdefault(current_karat, {})["buy"] = val
-                print(f"  ↳ Parsed {current_karat} buy  = {val}")
-                current_karat = None
-
-        # جنيه الذهب
-        if "الجنيه الذهب" in line or (
-            "جنيه" in line and "ذهب" in line and "عيار" not in line
-        ):
-            val = extract_number(line)
-            if not val and i + 1 < len(lines):
-                val = extract_number(lines[i + 1])
-            if val and val > 10000:
-                prices["pound"] = val
-                print(f"  ↳ Parsed pound = {val}")
-
-        # أوقية عالمية
-        if "الأوقية" in line or "عالمياً" in line:
-            val = extract_number(line)
-            if not val and i + 1 < len(lines):
-                val = extract_number(lines[i + 1])
-            if val and 1000 < val < 20000:
-                prices["oz_usd"] = val
-                print(f"  ↳ Parsed oz_usd = {val}")
-
-        # سعر الدولار
-        if "الدولار الأمريكي" in line:
-            val = extract_number(line)
-            if not val and i + 1 < len(lines):
-                val = extract_number(lines[i + 1])
-            if val and 40 < val < 200:
-                prices["usd_egp"] = val
-                print(f"  ↳ Parsed usd_egp = {val}")
-
-        i += 1
+    # ── دولار أمريكي ──
+    m = re.search(r"الدولار الأمريكي[^\n]*\n\s*([\d.]+)", html)
+    if m:
+        prices["usd_egp"] = safe_float(m.group(1))
+        print(f"  ↳ usd_egp = {prices['usd_egp']}")
 
     return prices
 
 
-# ──────────────────────────────────────────
-# ② dahabmasr.com — Secondary scraper
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# Tier 2 — dahabmasr.com
+# ──────────────────────────────────────────────────────────────
+
 def scrape_dahabmasr() -> dict:
     url = "https://dahabmasr.com/gold-price-today-ar"
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    print(f"  ↳ HTTP {response.status_code} from {url}")
-    if response.status_code in (403, 429, 503):
-        raise ValueError(f"Blocked: HTTP {response.status_code}")
-    response.raise_for_status()
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    print(f"  ↳ HTTP {resp.status_code} — dahabmasr.com ({len(resp.text):,} bytes)")
 
-    soup = BeautifulSoup(response.text, "lxml")
-    rows = soup.find_all("tr")
+    if resp.status_code in (403, 429, 503):
+        raise ValueError(f"Blocked by server: HTTP {resp.status_code}")
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "lxml")
     prices = {}
-    karat_map = {"24": "g24k", "21": "g21k", "18": "g18k", "14": "g14k"}
 
-    for row in rows:
+    for row in soup.find_all("tr"):
         text = row.get_text(" ", strip=True)
         if not text:
             continue
-        for karat, key in karat_map.items():
+        for karat, key in KARAT_MAP.items():
             if f"{karat}K" in text or f"عيار {karat}" in text:
-                nums = re.findall(r"[\d,]+\.?\d*", text)
-                nums = [float(n.replace(",", "")) for n in nums if float(n.replace(",", "")) > 1000]
+                nums = [
+                    float(n.replace(",", ""))
+                    for n in re.findall(r"[\d,]+\.?\d*", text)
+                    if float(n.replace(",", "")) > 1000
+                ]
                 if nums:
                     prices[key] = {"buy": max(nums), "sell": min(nums)}
+                    print(f"  ↳ {key}: buy={max(nums):,.0f}  sell={min(nums):,.0f}")
+
         if "جنيه" in text and "ذهب" in text:
-            nums = re.findall(r"[\d,]+\.?\d*", text)
-            nums = [float(n.replace(",", "")) for n in nums if float(n.replace(",", "")) > 10000]
+            nums = [
+                float(n.replace(",", ""))
+                for n in re.findall(r"[\d,]+\.?\d*", text)
+                if float(n.replace(",", "")) > 10000
+            ]
             if nums:
                 prices["pound"] = max(nums)
 
     return prices
 
 
-# ──────────────────────────────────────────
-# ③ Math fallback
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# Tier 3 — open.er-api.com  (USD/EGP — free, no API key needed)
+# ──────────────────────────────────────────────────────────────
+
+def get_usd_egp_openapi() -> float:
+    url = "https://open.er-api.com/v6/latest/USD"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("result") != "success":
+        raise ValueError(f"open.er-api error: {data.get('error-type', 'unknown')}")
+    rate = data["rates"].get("EGP")
+    if not rate:
+        raise ValueError("EGP not found in open.er-api response")
+    print(f"  ↳ open.er-api USD/EGP = {rate}")
+    return float(rate)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tier 4 — Yahoo Finance  (gold USD/oz)
+# ──────────────────────────────────────────────────────────────
+
+def get_gold_usd_yahoo() -> float:
+    df = yf.download("XAUUSD=X", period="1d", interval="5m",
+                     progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError("Empty dataframe from Yahoo for XAUUSD=X")
+    val = float(df["Close"].iloc[-1])
+    print(f"  ↳ Yahoo gold = {val:,.2f} USD/oz")
+    return val
+
+
+def get_usd_egp_yahoo() -> float:
+    df = yf.download("USDEGP=X", period="1d", interval="5m",
+                     progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError("Empty dataframe from Yahoo for USDEGP=X")
+    val = float(df["Close"].iloc[-1])
+    print(f"  ↳ Yahoo USD/EGP = {val:.2f}")
+    return val
+
+
+# ──────────────────────────────────────────────────────────────
+# Tier 5 — Math fallback
+# ──────────────────────────────────────────────────────────────
+
 def calculate_fallback(gold_usd: float, usd_egp: float) -> dict:
     g24 = (gold_usd * usd_egp) / GRAMS_PER_OZ
     return {
-        "g24k": {"buy": round(g24), "sell": round(g24 * 0.992)},
+        "g24k": {"buy": round(g24),           "sell": round(g24 * 0.992)},
         "g21k": {"buy": round(g24 * 21 / 24), "sell": round(g24 * 21 / 24 * 0.992)},
         "g18k": {"buy": round(g24 * 18 / 24), "sell": round(g24 * 18 / 24 * 0.992)},
         "g14k": {"buy": round(g24 * 14 / 24), "sell": round(g24 * 14 / 24 * 0.992)},
@@ -219,100 +239,116 @@ def calculate_fallback(gold_usd: float, usd_egp: float) -> dict:
     }
 
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # Main
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+
 def main():
-    print("⚡ Starting price update...")
+    print("=" * 55)
+    print("⚡ Gold price update started")
+    print("=" * 55)
 
     fallback_used = False
-    source_parts = []
+    source_parts  = []
 
-    # ── Step 1: Get USD/EGP ──────────────────
+    # ── USD/EGP ─────────────────────────────────────────────
+    print("\n📌 Step 1: USD/EGP rate")
     usd_egp = None
 
-    # Try edahabapp first (scraped later, but try open.er-api now for USD/EGP)
     try:
         usd_egp = with_retry(get_usd_egp_openapi)
-        source_parts.append("open.er-api.com (FX)")
-        print(f"✅ open.er-api OK | USD/EGP: {usd_egp:.2f}")
+        source_parts.append("open.er-api.com")
+        print(f"  ✅ USD/EGP = {usd_egp:.2f}  (open.er-api.com)")
     except Exception as e:
-        print(f"⚠️ open.er-api failed: {e}")
+        print(f"  ⚠️  open.er-api failed: {e}")
         try:
-            usd_egp_yahoo = with_retry(lambda: yf.download(
-                "USDEGP=X", period="1d", interval="5m",
-                progress=False, auto_adjust=True
-            ))
-            if usd_egp_yahoo is not None and not usd_egp_yahoo.empty:
-                usd_egp = float(usd_egp_yahoo["Close"].iloc[-1])
-                source_parts.append("Yahoo Finance (FX)")
-                print(f"✅ Yahoo FX OK | USD/EGP: {usd_egp:.2f}")
-            else:
-                raise ValueError("Empty Yahoo FX dataframe")
+            usd_egp = with_retry(get_usd_egp_yahoo)
+            source_parts.append("Yahoo FX")
+            print(f"  ✅ USD/EGP = {usd_egp:.2f}  (Yahoo Finance)")
         except Exception as e2:
-            print(f"⚠️ Yahoo FX failed: {e2} — using hardcoded 52.75")
-            usd_egp = 52.75
+            print(f"  ⚠️  Yahoo FX failed: {e2}")
+            usd_egp = 52.75          # last known value
             fallback_used = True
+            print(f"  ⚠️  Using hardcoded USD/EGP = {usd_egp}")
 
-    # ── Step 2: Get Gold USD/oz ──────────────
+    # ── Gold USD/oz ──────────────────────────────────────────
+    print("\n📌 Step 2: Gold USD/oz")
     gold_usd = None
+
     try:
         gold_usd = with_retry(get_gold_usd_yahoo)
-        source_parts.append("Yahoo Finance (Gold)")
-        print(f"✅ Yahoo Gold OK | {gold_usd:,.2f} USD/oz")
+        source_parts.append("Yahoo Gold")
+        print(f"  ✅ Gold = {gold_usd:,.2f} USD/oz  (Yahoo Finance)")
     except Exception as e:
-        print(f"⚠️ Yahoo Gold failed: {e} — using hardcoded 4493")
-        gold_usd = 4493  # current approximate value from edahabapp screenshot
+        print(f"  ⚠️  Yahoo gold failed: {e}")
+        gold_usd = 4493              # last known value from edahabapp
         fallback_used = True
+        print(f"  ⚠️  Using hardcoded gold = {gold_usd} USD/oz")
 
-    # ── Step 3: Get local EGP gold prices ───
+    # ── Local EGP prices ─────────────────────────────────────
+    print("\n📌 Step 3: Local EGP gold prices")
     local_prices = {}
+
+    # — Try edahabapp —
     try:
         local_prices = with_retry(scrape_edahab)
-        has_prices = (
-            local_prices.get("g24k", {}).get("buy")
-            and local_prices.get("g21k", {}).get("buy")
-        )
-        if has_prices:
-            source_parts.append("edahabapp.com")
-            print(f"✅ eDahab OK | 24K buy: {local_prices['g24k']['buy']:,} | 21K buy: {local_prices['g21k']['buy']:,}")
-            # Override USD/EGP with local value if available (more accurate)
-            if local_prices.get("usd_egp"):
-                usd_egp = local_prices["usd_egp"]
-                print(f"   ↳ USD/EGP overridden from edahabapp: {usd_egp}")
-            # Override gold_usd with oz price from page if available
-            if local_prices.get("oz_usd"):
-                gold_usd = local_prices["oz_usd"]
-                print(f"   ↳ Gold USD/oz overridden from edahabapp: {gold_usd}")
-        else:
-            raise ValueError(f"Incomplete prices from edahabapp: {list(local_prices.keys())}")
+        has_24 = isinstance(local_prices.get("g24k"), dict) and local_prices["g24k"].get("buy")
+        has_21 = isinstance(local_prices.get("g21k"), dict) and local_prices["g21k"].get("buy")
+
+        if not (has_24 and has_21):
+            raise ValueError(
+                f"Incomplete data from edahabapp. Keys found: {list(local_prices.keys())}"
+            )
+
+        source_parts.append("edahabapp.com")
+        print(f"  ✅ edahabapp OK")
+
+        # Override with live local values when available
+        if local_prices.get("usd_egp"):
+            usd_egp = local_prices["usd_egp"]
+            print(f"  ↳ USD/EGP overridden from page: {usd_egp}")
+        if local_prices.get("oz_usd"):
+            gold_usd = local_prices["oz_usd"]
+            print(f"  ↳ Gold USD/oz overridden from page: {gold_usd}")
+
     except Exception as e:
-        print(f"⚠️ eDahab failed: {e} — trying dahabmasr.com...")
+        print(f"  ⚠️  edahabapp failed: {e}")
+
+        # — Try dahabmasr —
         try:
             local_prices = with_retry(scrape_dahabmasr)
-            if local_prices.get("g24k"):
-                source_parts.append("dahabmasr.com")
-                print(f"✅ DahabMasr OK | 24K buy: {local_prices['g24k']['buy']:,}")
-            else:
-                raise ValueError(f"Incomplete prices from dahabmasr: {list(local_prices.keys())}")
+            has_24 = isinstance(local_prices.get("g24k"), dict) and local_prices["g24k"].get("buy")
+
+            if not has_24:
+                raise ValueError(
+                    f"Incomplete data from dahabmasr. Keys found: {list(local_prices.keys())}"
+                )
+
+            source_parts.append("dahabmasr.com")
+            print(f"  ✅ dahabmasr OK")
+
         except Exception as e2:
-            print(f"⚠️ DahabMasr failed: {e2} — using math fallback")
+            print(f"  ⚠️  dahabmasr failed: {e2}")
+            print("  ⚠️  Using math fallback for all EGP prices")
             local_prices = calculate_fallback(gold_usd, usd_egp)
             source_parts.append("Fallback Calculation")
             fallback_used = True
 
+    # ── Build payload ─────────────────────────────────────────
     fallback_prices = calculate_fallback(gold_usd, usd_egp)
 
     def get_price(key: str, subkey: str = "buy"):
         val = local_prices.get(key)
-        if val:
-            return val.get(subkey) if isinstance(val, dict) else val
+        if isinstance(val, dict):
+            return val.get(subkey)
+        if isinstance(val, (int, float)) and subkey == "buy":
+            return val
         val = fallback_prices.get(key)
-        if val:
-            return val.get(subkey) if isinstance(val, dict) else val
+        if isinstance(val, dict):
+            return val.get(subkey)
         return None
 
-    status = "fallback" if fallback_used else "live"
+    status       = "fallback" if fallback_used else "live"
     source_label = " + ".join(source_parts) if source_parts else "Fallback Calculation"
 
     payload = {
@@ -341,11 +377,14 @@ def main():
         "timestamp":     datetime.now(timezone.utc).isoformat(),
     }
 
+    # ── Write output ──────────────────────────────────────────
     os.makedirs("data", exist_ok=True)
     with open("data/prices.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    print("\n✅ data/prices.json updated successfully")
+    print("\n" + "=" * 55)
+    print(f"✅ Done  |  status={status}  |  source={source_label}")
+    print("=" * 55)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
