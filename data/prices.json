@@ -8,10 +8,10 @@
   "gold_egp_gram_18k": 5714,
   "gold_egp_gram_18k_sell": 5669,
   "gold_egp_gram_14k": 4445,
-  "gold_egp_pound": 53335,
+  "gold_egp_pound": null,
   "gold_egp_oz": 236978,
   "status": "fallback",
   "fallback_used": true,
   "source": "open.er-api.com + Fallback Calculation",
-  "timestamp": "2026-03-28T13:18:44.045760+00:00"
+  "timestamp": "2026-03-28T13:25:49.202147+00:00"
 }
