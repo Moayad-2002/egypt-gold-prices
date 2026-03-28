@@ -1,17 +1,17 @@
 {
-  "gold_usd_oz": 5182,
+  "gold_usd_oz": 3300,
   "usd_egp": 52.5,
-  "gold_egp_gram_24k": 8747,
-  "gold_egp_gram_24k_sell": 8659,
-  "gold_egp_gram_21k": 7653,
-  "gold_egp_gram_21k_sell": 7577,
-  "gold_egp_gram_18k": 6560,
-  "gold_egp_gram_18k_sell": 6494,
-  "gold_egp_gram_14k": 5102,
-  "gold_egp_pound": 61227,
-  "gold_egp_oz": 272062,
+  "gold_egp_gram_24k": 5570,
+  "gold_egp_gram_24k_sell": 5514,
+  "gold_egp_gram_21k": 4874,
+  "gold_egp_gram_21k_sell": 4825,
+  "gold_egp_gram_18k": 4178,
+  "gold_egp_gram_18k_sell": 4136,
+  "gold_egp_gram_14k": 3249,
+  "gold_egp_pound": 38991,
+  "gold_egp_oz": 173246,
   "status": "fallback",
   "fallback_used": true,
   "source": "Fallback Calculation",
-  "timestamp": "2026-03-28T10:00:29.753233+00:00"
+  "timestamp": "2026-03-28T10:09:07.795794+00:00"
 }
