@@ -12,6 +12,6 @@
   "gold_egp_oz": 236978,
   "status": "fallback",
   "fallback_used": true,
-  "source": "open.er-api.com (FX) + Fallback Calculation",
-  "timestamp": "2026-03-28T12:23:41.008538+00:00"
+  "source": "open.er-api.com + Fallback Calculation",
+  "timestamp": "2026-03-28T13:18:44.045760+00:00"
 }
