@@ -4,13 +4,14 @@ scripts/fetch_prices.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 المصدر الأساسي:  edahabapp.com
 المصدر الثانوي: dahabmasr.com
-المصدر الاحتياطي: Yahoo Finance (حساب رياضي)
+المصدر الاحتياطي: Yahoo Finance + frankfurter.app
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -31,54 +32,71 @@ HEADERS = {
 
 
 # ──────────────────────────────────────────
-# Yahoo Finance
+# Retry wrapper
+# ──────────────────────────────────────────
+def with_retry(fn, attempts=3, delay=3):
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            print(f"  ↳ Attempt {i+1}/{attempts} failed: {e}")
+            if i < attempts - 1:
+                time.sleep(delay)
+    raise last_err
+
+
+# ──────────────────────────────────────────
+# Yahoo Finance — yf.download (more reliable than fast_info on CI)
 # ──────────────────────────────────────────
 def get_yahoo_price(ticker: str) -> float:
-    ticker_obj = yf.Ticker(ticker)
-    price = ticker_obj.fast_info.last_price
-    if not price:
-        raise ValueError(f"فشل جلب السعر من Yahoo: {ticker}")
-    return float(price)
+    df = yf.download(ticker, period="1d", interval="1m",
+                     progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError(f"Empty dataframe for {ticker}")
+    return float(df["Close"].iloc[-1])
 
 
 # ──────────────────────────────────────────
-# ① edahabapp.com  ← المصدر الأساسي الجديد
+# frankfurter.app — USD/EGP fallback (works on GitHub Actions)
+# ──────────────────────────────────────────
+def get_usd_egp_frankfurter() -> float:
+    url = "https://api.frankfurter.app/latest?base=USD&symbols=EGP"
+    r = requests.get(url, timeout=10, headers=HEADERS)
+    r.raise_for_status()
+    rate = r.json().get("rates", {}).get("EGP")
+    if not rate:
+        raise ValueError("No EGP rate in frankfurter response")
+    return float(rate)
+
+
+# ──────────────────────────────────────────
+# ① edahabapp.com — Primary source
 # ──────────────────────────────────────────
 def scrape_edahab() -> dict:
-    """
-    يسحب أسعار الذهب والدولار من edahabapp.com
-    الصفحة تعرض الأسعار كنصوص عربية واضحة بهذا الشكل:
-        الذهب عيار 24:
-        بيع: 7840 جنيه
-        شراء: 7784 جنيه
-    """
     url = "https://edahabapp.com/"
     response = requests.get(url, headers=HEADERS, timeout=15)
+    print(f"  ↳ HTTP {response.status_code} from {url}")
+    if response.status_code in (403, 429, 503):
+        raise ValueError(f"Blocked by server: HTTP {response.status_code}")
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "lxml")
-
-    # نحوّل كل النص إلى سطور نظيفة
     full_text = soup.get_text(separator="\n", strip=True)
     lines = [l.strip() for l in full_text.splitlines() if l.strip()]
 
     prices = {}
 
-    def extract_number(text: str) -> float | None:
-        """يسحب أول رقم صحيح من النص (يتجاهل الفواصل)"""
+    def extract_number(text: str):
         nums = re.findall(r"[\d,]+", text)
         for n in nums:
             val = float(n.replace(",", ""))
-            if val > 100:          # تجاهل الأرقام الصغيرة جداً
+            if val > 100:
                 return val
         return None
 
-    karat_map = {
-        "24": "g24k",
-        "21": "g21k",
-        "18": "g18k",
-        "14": "g14k",
-    }
+    karat_map = {"24": "g24k", "21": "g21k", "18": "g18k", "14": "g14k"}
 
     i = 0
     current_karat = None
@@ -86,52 +104,34 @@ def scrape_edahab() -> dict:
     while i < len(lines):
         line = lines[i]
 
-        # ── تحديد العيار الحالي ──
         for karat, key in karat_map.items():
             if f"عيار {karat}" in line:
                 current_karat = key
                 break
 
-        # ── سعر البيع ──
         if current_karat and "بيع" in line and "شراء" not in line:
             val = extract_number(line)
             if val:
-                if current_karat not in prices:
-                    prices[current_karat] = {}
-                prices[current_karat]["sell"] = val
+                prices.setdefault(current_karat, {})["sell"] = val
 
-        # ── سعر الشراء ──
         if current_karat and "شراء" in line:
             val = extract_number(line)
             if val:
-                if current_karat not in prices:
-                    prices[current_karat] = {}
-                prices[current_karat]["buy"] = val
-                current_karat = None  # انتهى هذا العيار
+                prices.setdefault(current_karat, {})["buy"] = val
+                current_karat = None
 
-        # ── جنيه الذهب ──
         if "الجنيه الذهب" in line or ("جنيه" in line and "ذهب" in line and "عيار" not in line):
-            val = extract_number(line)
-            if not val:
-                # الرقم قد يكون في السطر التالي
-                if i + 1 < len(lines):
-                    val = extract_number(lines[i + 1])
+            val = extract_number(line) or (extract_number(lines[i + 1]) if i + 1 < len(lines) else None)
             if val and val > 10000:
                 prices["pound"] = val
 
-        # ── أوقية عالمية (USD) ──
         if "الأوقية" in line or ("عالمياً" in line and "دولار" in line):
-            val = extract_number(line)
-            if not val and i + 1 < len(lines):
-                val = extract_number(lines[i + 1])
+            val = extract_number(line) or (extract_number(lines[i + 1]) if i + 1 < len(lines) else None)
             if val and 1000 < val < 20000:
                 prices["oz_usd"] = val
 
-        # ── سعر الدولار ──
         if "الدولار الأمريكي" in line or "الدولار" in line:
-            val = extract_number(line)
-            if not val and i + 1 < len(lines):
-                val = extract_number(lines[i + 1])
+            val = extract_number(line) or (extract_number(lines[i + 1]) if i + 1 < len(lines) else None)
             if val and 40 < val < 200:
                 prices["usd_egp"] = val
 
@@ -141,23 +141,21 @@ def scrape_edahab() -> dict:
 
 
 # ──────────────────────────────────────────
-# ② dahabmasr.com  ← المصدر الثانوي
+# ② dahabmasr.com — Secondary source
 # ──────────────────────────────────────────
 def scrape_dahabmasr() -> dict:
     url = "https://dahabmasr.com/gold-price-today-ar"
     response = requests.get(url, headers=HEADERS, timeout=15)
+    print(f"  ↳ HTTP {response.status_code} from {url}")
+    if response.status_code in (403, 429, 503):
+        raise ValueError(f"Blocked by server: HTTP {response.status_code}")
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "lxml")
     rows = soup.find_all("tr")
 
     prices = {}
-    karat_map = {
-        "24": "g24k",
-        "21": "g21k",
-        "18": "g18k",
-        "14": "g14k",
-    }
+    karat_map = {"24": "g24k", "21": "g21k", "18": "g18k", "14": "g14k"}
 
     for row in rows:
         text = row.get_text(" ", strip=True)
@@ -187,7 +185,7 @@ def scrape_dahabmasr() -> dict:
 
 
 # ──────────────────────────────────────────
-# ③ Fallback – حساب رياضي من Yahoo
+# ③ Fallback — math from Yahoo prices
 # ──────────────────────────────────────────
 def calculate_fallback(gold_usd: float, usd_egp: float) -> dict:
     g24 = (gold_usd * usd_egp) / GRAMS_PER_OZ
@@ -204,50 +202,66 @@ def calculate_fallback(gold_usd: float, usd_egp: float) -> dict:
 # Main
 # ──────────────────────────────────────────
 def main():
-    print("⚡ بدء تحديث الأسعار...")
+    print("⚡ Starting price update...")
 
     fallback_used = False
     source_parts = []
 
-    # ── Yahoo Finance للسعر العالمي ──
+    # ── Gold price (Yahoo) ──
+    gold_usd = None
     try:
-        gold_usd = get_yahoo_price("XAUUSD=X")
-        usd_egp = get_yahoo_price("USDEGP=X")
-        source_parts.append("Yahoo Finance")
-        print(f"✅ Yahoo OK | Gold USD/Oz: {gold_usd:,.2f} | USD/EGP: {usd_egp:.2f}")
+        gold_usd = with_retry(lambda: get_yahoo_price("XAUUSD=X"))
+        source_parts.append("Yahoo Finance (Gold)")
+        print(f"✅ Yahoo Gold OK | {gold_usd:,.2f} USD/oz")
     except Exception as e:
-        print(f"⚠️ فشل Yahoo: {e}")
-        gold_usd = 5182
-        usd_egp = 52.5
+        print(f"⚠️ Yahoo Gold failed: {e}")
+        gold_usd = 3300
         fallback_used = True
 
-    # ── المصدر الأساسي: edahabapp.com ──
+    # ── USD/EGP — Yahoo first, frankfurter as backup ──
+    usd_egp = None
+    try:
+        usd_egp = with_retry(lambda: get_yahoo_price("USDEGP=X"))
+        source_parts.append("Yahoo Finance (FX)")
+        print(f"✅ Yahoo FX OK | USD/EGP: {usd_egp:.2f}")
+    except Exception as e:
+        print(f"⚠️ Yahoo FX failed: {e} — trying frankfurter.app...")
+        try:
+            usd_egp = with_retry(get_usd_egp_frankfurter)
+            source_parts.append("frankfurter.app (FX)")
+            print(f"✅ Frankfurter OK | USD/EGP: {usd_egp:.2f}")
+        except Exception as e2:
+            print(f"⚠️ Frankfurter failed: {e2}")
+            usd_egp = 52.5
+            fallback_used = True
+
+    # ── Local gold prices — edahabapp first, dahabmasr as backup ──
     local_prices = {}
     try:
-        local_prices = scrape_edahab()
-        has_prices = local_prices.get("g24k", {}).get("buy") and local_prices.get("g21k", {}).get("buy")
+        local_prices = with_retry(scrape_edahab)
+        has_prices = (
+            local_prices.get("g24k", {}).get("buy")
+            and local_prices.get("g21k", {}).get("buy")
+        )
         if has_prices:
             source_parts.append("edahabapp.com")
-            print(f"✅ eDahab OK | 24K Buy: {local_prices['g24k']['buy']:,} | 21K Buy: {local_prices['g21k']['buy']:,}")
-            # نستخدم سعر الدولار من edahabapp إن وُجد
+            print(f"✅ eDahab OK | 24K: {local_prices['g24k']['buy']:,} | 21K: {local_prices['g21k']['buy']:,}")
             if local_prices.get("usd_egp"):
                 usd_egp = local_prices["usd_egp"]
-                print(f"   ↳ USD/EGP من edahabapp: {usd_egp}")
+                print(f"   ↳ USD/EGP from edahabapp: {usd_egp}")
         else:
-            raise ValueError("لم يتم العثور على أسعار كافية في edahabapp.com")
+            raise ValueError("Not enough prices found on edahabapp.com")
     except Exception as e:
-        print(f"⚠️ فشل edahabapp: {e}")
-
-        # ── المصدر الثانوي: dahabmasr.com ──
+        print(f"⚠️ eDahab failed: {e} — trying dahabmasr.com...")
         try:
-            local_prices = scrape_dahabmasr()
+            local_prices = with_retry(scrape_dahabmasr)
             if local_prices.get("g24k"):
-                source_parts.append("dahabmasr.com (fallback)")
-                print(f"✅ DahabMasr OK | 24K Buy: {local_prices['g24k']['buy']:,}")
+                source_parts.append("dahabmasr.com")
+                print(f"✅ DahabMasr OK | 24K: {local_prices['g24k']['buy']:,}")
             else:
-                raise ValueError("لم يتم العثور على أسعار كافية في dahabmasr.com")
+                raise ValueError("Not enough prices found on dahabmasr.com")
         except Exception as e2:
-            print(f"⚠️ فشل DahabMasr: {e2}")
+            print(f"⚠️ DahabMasr failed: {e2} — using math fallback")
             local_prices = calculate_fallback(gold_usd, usd_egp)
             source_parts.append("Fallback Calculation")
             fallback_used = True
@@ -267,8 +281,8 @@ def main():
     source_label = " + ".join(source_parts) if source_parts else "Fallback Calculation"
 
     payload = {
-        "gold_usd_oz": round(gold_usd, 2),
-        "usd_egp": round(usd_egp, 2),
+        "gold_usd_oz":            round(gold_usd, 2),
+        "usd_egp":                round(usd_egp, 2),
 
         "gold_egp_gram_24k":      get_price("g24k", "buy"),
         "gold_egp_gram_24k_sell": get_price("g24k", "sell"),
@@ -293,10 +307,10 @@ def main():
     }
 
     os.makedirs("data", exist_ok=True)
-    with open("data/prices.json", "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
+    with open("data/prices.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    print("✅ تم تحديث data/prices.json بنجاح")
+    print("\n✅ data/prices.json updated successfully")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
