@@ -1,6 +1,6 @@
 {
-  "gold_usd_oz": 4520,
-  "usd_egp": 53.53,
+  "gold_usd_oz": 4523,
+  "usd_egp": 53.63,
   "gold_egp_gram_24k": 7910,
   "gold_egp_gram_24k_sell": 7966,
   "gold_egp_gram_21k": 6921,
@@ -13,5 +13,5 @@
   "status": "live",
   "fallback_used": false,
   "source": "edahabapp.com via Cloudflare Worker",
-  "timestamp": "2026-03-30T05:50:42.576339+00:00"
+  "timestamp": "2026-03-30T07:45:31.357838+00:00"
 }
