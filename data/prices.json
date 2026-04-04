@@ -1,17 +1,17 @@
 {
   "gold_usd_oz": 4676,
   "usd_egp": 54.3,
-  "gold_egp_gram_24k": 8149,
-  "gold_egp_gram_24k_sell": 8183,
-  "gold_egp_gram_21k": 7130,
-  "gold_egp_gram_21k_sell": 7160,
-  "gold_egp_gram_18k": 6111,
-  "gold_egp_gram_18k_sell": 6137,
-  "gold_egp_gram_14k": 4753,
-  "gold_egp_pound": 57281,
-  "gold_egp_oz": 253462,
+  "gold_egp_gram_24k": 8143,
+  "gold_egp_gram_24k_sell": 8177,
+  "gold_egp_gram_21k": 7125,
+  "gold_egp_gram_21k_sell": 7154,
+  "gold_egp_gram_18k": 6107,
+  "gold_egp_gram_18k_sell": 6132,
+  "gold_egp_gram_14k": 4750,
+  "gold_egp_pound": 57239,
+  "gold_egp_oz": 253276,
   "status": "live",
   "fallback_used": false,
   "source": "edahabapp.com via Cloudflare Worker",
-  "timestamp": "2026-04-04T13:59:15.603813+00:00"
+  "timestamp": "2026-04-04T14:43:30.885016+00:00"
 }
